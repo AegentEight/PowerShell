@@ -1,0 +1,120 @@
+ # Written by AegentEight
+    <#
+    .Synopsis
+        Website has a finite license limit with a timeout of 90 minutes.  When licenses are exceeded, but an urgent matter 
+	requires immediate logon from a manager, users need to log out to free up a license.  Also, users tend to just close 
+	the browser instead of clicking log out, which means they are still taking up a license.  Vendor does not allow us 
+	access to DB unfortunately so we can't see who is logged in.  IIS logs show the ip of logons, but we can't always 
+	search for owner, especially when it's a shared computer.  This	script will search the server Security Event Logs 
+	for users logged into the website.  Once list is found, the usernames will be extracted and an email will be generated
+	to those people as well as emailing the list of usernames to a manager, supprt DL, etc.  This script runs on the 
+	Application/IIS server.  
+    .Description
+        This script will email website users when a license needs to be freed up.  List of users will be emailed to a DL.
+    .Example
+        .\WebsiteLogons.ps1
+    .Change Log
+        1.0 - 04/18/19 - Initial code
+        1.1 - 04/19/19 - Added CSV file path and mail server try/catch.
+    #>
+
+    [CmdletBinding()]
+    param()
+
+    #EMAIL SETTINGS
+    $To            = @("manager@company.com",
+                      "DL-SOMESUPPORTGROUP@company.com")      
+    $From          = "WEBSITE_LICENSE_ALERT@company.com"
+    $SMTP          = "smtpserver.company.com"
+    $Subject       = "Website License Report"
+    $Body          = "Attached is the list of usernames that logged onto the website in the past 90 minutes."
+    $SubjectUNAMEs = "Please log out of the website"
+    $BodyUNAMEs    = "Website Licenses have been exceeded!  Your attention is required to log out of
+                     the website as another user requires immediate access.  Please manually log out."
+
+    #VARIABLES
+    $Output        = "C:\Scripts\Logons.csv"
+    $User          = 'TargetUserName'
+    $Report        = @()
+
+    #################################################
+    ### ERROR CHECKING   ############################
+    #################################################
+
+    #Check if CSV path found
+    If(!(Test-Path -Path $Output)){
+        
+        #Notify user if not found and exit script
+        Write-Host "There is something wrong with path C:\Script, please let support know."
+        Exit
+    }
+
+    #################################################
+    ###  INITIALIZE  ################################
+    #################################################
+
+    #Check if CSV file exists and delete it if so
+    If(!$Output){
+         Remove-Item $Output
+    }
+
+    Write-Host "Scanning Event Log for website logons..."
+
+    #Scan Event Log using XML filters for all website logons within the past 90 minutes (5400000 milliseconds)
+    $Logons = Get-WinEvent -LogName Security -FilterXPath `
+                "*[System[EventID=4648 and TimeCreated[timediff(@SystemTime) <=5400000]] and `
+                EventData[Data[@Name='ProcessName']='C:\Windows\System32\inetsrv\w3wp.exe']]" `
+                -ErrorAction SilentlyContinue
+    
+    #If search does not discover any website logons, notify user and exit script
+    If(!$Logons){ 
+        Write-Host "In the past 90 minutes, no one has logged in.`n"
+        Exit
+    }
+    
+    #Convert discovered logs into readable XML
+    $Logons | ForEach-Object {
+                  ([xml]$_.ToXML()).Event.EventData | 
+
+                  #Create hashtable and parse XML data for usernames
+                  ForEach-Object {
+                      $UNAME = @{}
+                      $_.Data | Where-Object{ $User -contains $_.Name } | 
+            
+                      #Store usernames in hashtable
+                      ForEach-Object{ 
+                        $UNAME[$_.Name] = $_.'#text'
+                      }
+                
+                      #Add each hashtable element as an object into an array
+                      $Report += New-Object -Type PSObject -Property $UNAME
+                  }
+
+                  #Write array objects to a CSV
+                  $Report | Export-Csv -Path $Output -NoTypeInformation
+             }
+
+    #Remove duplicate usernames from CSV
+    (Get-Content $Output) | Select -Unique | Set-Content $Output
+
+    #Add domain to each username in the CSV
+    ForEach($Address in (Import-Csv -Path $Output) ){
+        $ToUNAME = $Address.TargetUserName + "@company.com"
+
+        #Send email to each username, but let script runner know if unable to
+        try{
+            Send-MailMessage -From $From -To $ToUNAME -Subject $SubjectUNAMEs -BodyAsHtml $BodyUNAMEs -SmtpServer $SMTP
+        }catch{
+            Write-Host "There is an issue communicating with the mail server.  Please inform support." -ForegroundColor Red
+        }
+    }
+
+    #Email manager and support advising them of the usernames that have been emailed, but let script runner know if unable to
+    try{
+        Send-MailMessage -From $From -To $To -Subject $Subject -BodyAsHtml $Body -Attachments $Output -SmtpServer $SMTP
+    }catch{
+        Write-Host "There is an issue communicating with the mail server.  Please inform support." -ForegroundColor Red
+    }
+
+    #Delete the CSV
+Remove-Item $Output
